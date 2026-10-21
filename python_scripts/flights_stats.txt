@@ -1,0 +1,117 @@
+
+from pyspark import pipelines as dp
+from pyspark.sql import functions as F
+
+
+@dp.table
+def flight_pipeline_statistics():
+
+    df = spark.read.table("ingest_flights")
+
+    # Identify columns available in the source table
+    available_columns = set(df.columns)
+
+    # Basic data volume statistics
+    aggregations = [
+        F.count("*").alias("total_records"),
+        F.countDistinct("icao24").alias("distinct_aircraft"),
+        F.count("icao24").alias("non_null_aircraft_ids"),
+        F.sum(
+            F.when(F.col("icao24").isNull(), 1).otherwise(0)
+        ).alias("null_aircraft_ids"),
+    ]
+
+    # Check important numeric fields
+    numeric_columns = [
+        "velocity",
+        "altitude",
+        "latitude",
+        "longitude",
+        "baro_altitude",
+        "geo_altitude",
+        "vertical_rate",
+    ]
+
+    for column_name in numeric_columns:
+        if column_name in available_columns:
+
+            aggregations.extend([
+                F.count(column_name).alias(
+                    f"{column_name}_non_null_count"
+                ),
+                F.avg(column_name).alias(
+                    f"avg_{column_name}"
+                ),
+                F.min(column_name).alias(
+                    f"min_{column_name}"
+                ),
+                F.max(column_name).alias(
+                    f"max_{column_name}"
+                ),
+                F.stddev(column_name).alias(
+                    f"stddev_{column_name}"
+                ),
+            ])
+
+            # Count physically implausible or invalid values
+            if column_name in [
+                "velocity", "altitude", "baro_altitude",
+                "geo_altitude"
+            ]:
+                aggregations.append(
+                    F.sum(
+                        F.when(F.col(column_name) < 0, 1)
+                         .otherwise(0)
+                    ).alias(f"negative_{column_name}_count")
+                )
+
+    # Flight event timestamp statistics
+    if "time_position" in available_columns:
+        aggregations.extend([
+            F.min("time_position").alias("earliest_position_time"),
+            F.max("time_position").alias("latest_position_time"),
+            F.sum(
+                F.when(F.col("time_position").isNull(), 1)
+                 .otherwise(0)
+            ).alias("null_position_time_count"),
+        ])
+
+    # Last-contact timestamp statistics
+    if "last_contact" in available_columns:
+        aggregations.extend([
+            F.min("last_contact").alias("earliest_last_contact"),
+            F.max("last_contact").alias("latest_last_contact"),
+            F.sum(
+                F.when(F.col("last_contact").isNull(), 1)
+                 .otherwise(0)
+            ).alias("null_last_contact_count"),
+        ])
+
+    # Number of records missing key flight attributes
+    key_columns = [
+        c for c in [
+            "icao24", "velocity", "latitude",
+            "longitude", "time_position"
+        ]
+        if c in available_columns
+    ]
+
+    if key_columns:
+        missing_key_condition = None
+
+        for column_name in key_columns:
+            condition = F.col(column_name).isNull()
+
+            missing_key_condition = (
+                condition if missing_key_condition is None
+                else missing_key_condition | condition
+            )
+
+        aggregations.append(
+            F.sum(
+                F.when(missing_key_condition, 1).otherwise(0)
+            ).alias("records_missing_key_fields")
+        )
+
+    # Produce one row containing the current snapshot statistics
+    return df.agg(*aggregations)
